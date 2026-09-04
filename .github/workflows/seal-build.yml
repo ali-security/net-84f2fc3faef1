@@ -1,0 +1,95 @@
+name: seal-build
+
+# Upstream golang.org/x/net has no GitHub Actions CI (it is developed on
+# Gerrit and tested by the golang.org build dashboard), so this workflow is
+# authored by Seal. Commands are taken from the repo itself: the module path
+# and toolchain come from go.mod (`module golang.org/x/net`, `go 1.24.0`) and
+# the suite is the project's own `go test ./...` over every package.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated Go test names to run instead of the full suite
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: auto
+      GOFLAGS: -mod=mod
+      # GOPROXY is left at its default. The release-date registry time machine
+      # is not reachable from these runners, and Go does not need it: go.mod and
+      # go.sum already pin every dependency to an exact version and hash, and
+      # the one module resolved outside them (golang.org/x/mod, used only by the
+      # zip helper) is pinned explicitly below.
+      #
+      # GOSUMDB/GONOSUMDB are exported per-step instead of here: a bare `off`
+      # in YAML is a boolean, and quoting it does not survive the fork's
+      # workflow round-trip, so the value would reach the runner as "false".
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.x
+          cache: false
+
+      - name: Report toolchain
+        run: go version
+
+      # Stage the module tree without .github. The public module zip for
+      # v0.45.0 carries no .github members, so the file set only matches if the
+      # workflow and helper Seal adds are kept out of the archive.
+      - name: Stage module source without .github
+        run: |
+          mkdir -p /tmp/modsrc
+          tar -cf - --exclude=./.git --exclude=./.github . | tar -xf - -C /tmp/modsrc
+          test ! -e /tmp/modsrc/.github
+
+      # The helper is compiled in its own throwaway module so golang.org/x/mod
+      # is never added to golang.org/x/net's own go.mod.
+      - name: Build module zip
+        run: |
+          export GOSUMDB=off GONOSUMDB='*'
+          mkdir -p /tmp/zipper dist
+          cp .github/seal/create_mod.go /tmp/zipper/
+          cd /tmp/zipper
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run ./create_mod.go golang.org/x/net v0.45.0 /tmp/modsrc "$GITHUB_WORKSPACE/dist/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/dist/v0.45.0.zip" | tail -3
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: |
+          filter="${{ inputs.test-filter }}"
+          if [ -n "$filter" ]; then
+            go test -v -run "^($(echo "$filter" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $filter; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: dist/v0.45.0.zip
+          if-no-files-found: error
